@@ -133,6 +133,30 @@ class Account(Base):
     )
 
 
+class PostResetHeartbeatObservation(Base):
+    __tablename__ = "post_reset_heartbeat_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "window",
+            "stalled_reset_at",
+            name="uq_post_reset_heartbeat_account_window_reset",
+        ),
+        Index("idx_post_reset_heartbeat_account_window", "account_id", "window"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    window: Mapped[str] = mapped_column(String, nullable=False)
+    stalled_reset_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    heartbeat_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    account: Mapped[Account] = relationship("Account")
+
+
 class UsageHistory(Base):
     __tablename__ = "usage_history"
 

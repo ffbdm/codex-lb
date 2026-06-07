@@ -135,11 +135,24 @@ class UsageEntry:
     credits_balance: float | None
 
 
+@dataclass(slots=True)
+class StubPostResetObservation:
+    id: int
+    account_id: str
+    window: str
+    stalled_reset_at: int
+    observed_count: int
+    heartbeat_sent_at: datetime | None = None
+
+
 class StubUsageRepository:
     def __init__(self, *, return_rows: bool = False) -> None:
         self.entries: list[UsageEntry] = []
+        self.observations: dict[tuple[str, str, int], StubPostResetObservation] = {}
+        self.cleared_observations: list[tuple[str, str]] = []
         self._return_rows = return_rows
         self._next_id = 1
+        self._next_observation_id = 1
 
     async def latest_entry_for_account(
         self,
@@ -166,6 +179,58 @@ class StubUsageRepository:
                     credits_balance=entry.credits_balance,
                 )
         return None
+
+    async def record_post_reset_observation(
+        self,
+        *,
+        account_id: str,
+        window: str,
+        stalled_reset_at: int,
+        observed_at: datetime | None = None,
+    ) -> StubPostResetObservation:
+        del observed_at
+        key = (account_id, window, stalled_reset_at)
+        observation = self.observations.get(key)
+        if observation is None:
+            observation = StubPostResetObservation(
+                id=self._next_observation_id,
+                account_id=account_id,
+                window=window,
+                stalled_reset_at=stalled_reset_at,
+                observed_count=1,
+            )
+            self._next_observation_id += 1
+            self.observations[key] = observation
+        else:
+            observation.observed_count += 1
+        return observation
+
+    async def mark_post_reset_heartbeat_sent(
+        self,
+        observation_id: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> bool:
+        for observation in self.observations.values():
+            if observation.id != observation_id:
+                continue
+            if observation.heartbeat_sent_at is not None:
+                return False
+            observation.heartbeat_sent_at = sent_at or datetime.now(tz=timezone.utc)
+            return True
+        return False
+
+    async def clear_post_reset_observations(
+        self,
+        *,
+        account_id: str,
+        window: str,
+    ) -> int:
+        self.cleared_observations.append((account_id, window))
+        keys = [key for key in self.observations if key[0] == account_id and key[1] == window]
+        for key in keys:
+            self.observations.pop(key, None)
+        return len(keys)
 
     async def add_entry(
         self,
@@ -226,6 +291,15 @@ class AdditionalUsageEntry:
     reset_at: int | None
     window_minutes: int | None
     quota_key: str | None = None
+
+
+class StubRequestLogsRepository:
+    def __init__(self) -> None:
+        self.logs: list[dict[str, Any]] = []
+
+    async def add_log(self, *args: Any, **kwargs: Any) -> object:
+        self.logs.append({"args": args, "kwargs": kwargs})
+        return object()
 
 
 class StubAdditionalUsageRepository:
@@ -642,6 +716,105 @@ async def test_force_refresh_respects_usage_refresh_disabled(monkeypatch: pytest
     assert refreshed is False
     refresh_account.assert_not_awaited()
     get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_post_reset_heartbeat_sends_after_three_stale_observations(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage_repo = StubUsageRepository()
+    updater = UsageUpdater(usage_repo)
+    account = _make_account("acc_post_reset_heartbeat", "workspace_post_reset_heartbeat")
+    now_epoch = 1_700_000_000
+    stale_reset_at = now_epoch - 1
+    heartbeat = AsyncMock(return_value=200)
+    monkeypatch.setattr(updater, "_send_post_reset_heartbeat", heartbeat)
+
+    window = usage_updater_module.UsageWindow(used_percent=99.0, reset_at=stale_reset_at)
+
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+    heartbeat.assert_not_awaited()
+
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+
+    heartbeat.assert_awaited_once_with(account, window_name="primary", stalled_reset_at=stale_reset_at)
+
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+
+    heartbeat.assert_awaited_once()
+    observation = usage_repo.observations[(account.id, "primary", stale_reset_at)]
+    assert observation.observed_count == 4
+    assert observation.heartbeat_sent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_post_reset_heartbeat_clears_observations_when_window_advances() -> None:
+    usage_repo = StubUsageRepository()
+    updater = UsageUpdater(usage_repo)
+    account = _make_account("acc_post_reset_clear", "workspace_post_reset_clear")
+    now_epoch = 1_700_000_000
+    stale_reset_at = now_epoch - 1
+    await usage_repo.record_post_reset_observation(
+        account_id=account.id,
+        window="secondary",
+        stalled_reset_at=stale_reset_at,
+    )
+
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="secondary",
+        window=usage_updater_module.UsageWindow(used_percent=2.0, reset_at=now_epoch + 7 * 24 * 3600),
+        now_epoch=now_epoch,
+    )
+
+    assert usage_repo.observations == {}
+    assert usage_repo.cleared_observations == [(account.id, "secondary")]
+
+
+@pytest.mark.asyncio
+async def test_post_reset_heartbeat_records_request_log() -> None:
+    request_logs_repo = StubRequestLogsRepository()
+    updater = UsageUpdater(StubUsageRepository(), request_logs_repo=request_logs_repo)
+    account = _make_account("acc_post_reset_log", "workspace_post_reset_log")
+    requested_at = datetime.now(tz=timezone.utc)
+
+    await updater._log_post_reset_heartbeat_request(
+        account,
+        window_name="primary",
+        stalled_reset_at=123,
+        requested_at=requested_at,
+        latency_ms=42,
+        status_code=200,
+        error_message=None,
+    )
+
+    assert len(request_logs_repo.logs) == 1
+    call = request_logs_repo.logs[0]
+    assert call["kwargs"]["account_id"] == account.id
+    assert call["kwargs"]["model"] == usage_updater_module.POST_RESET_HEARTBEAT_MODEL
+    assert call["kwargs"]["status"] == "success"
+    assert call["kwargs"]["source"] == "post_reset_heartbeat"
+    assert call["kwargs"]["transport"] == "post_reset_heartbeat"
+    assert call["kwargs"]["upstream_status_code"] == 200
 
 
 @pytest.mark.asyncio

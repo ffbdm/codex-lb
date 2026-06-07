@@ -105,7 +105,7 @@ class UsageRefreshScheduler:
                     before_primary = await usage_repo.latest_by_account(window="primary")
                     before_secondary = await usage_repo.latest_by_account(window="secondary")
                     accounts = await accounts_repo.list_accounts()
-                    updater = UsageUpdater(usage_repo, accounts_repo, additional_usage_repo)
+                    updater = UsageUpdater(usage_repo, accounts_repo, additional_usage_repo, request_logs_repo)
                     usage_written = await updater.refresh_accounts(accounts, before_primary)
                     if usage_written:
                         after_primary = await usage_repo.latest_by_account(window="primary")

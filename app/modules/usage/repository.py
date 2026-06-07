@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config.settings import get_settings
 from app.core.usage.types import UsageAggregateRow, UsageTrendBucket
 from app.core.utils.time import utcnow
-from app.db.models import Account, AdditionalUsageHistory, UsageHistory
+from app.db.models import Account, AdditionalUsageHistory, PostResetHeartbeatObservation, UsageHistory
 from app.db.session import sqlite_writer_section
 from app.db.sqlite_utils import sqlite_db_path_from_url
 from app.modules.usage.additional_quota_keys import (
@@ -24,6 +24,16 @@ from app.modules.usage.additional_quota_keys import (
 )
 
 _PRIMARY_WINDOW_LITERAL = literal_column("'primary'")
+
+
+@dataclass(frozen=True, slots=True)
+class PostResetHeartbeatObservationSnapshot:
+    id: int
+    account_id: str
+    window: str
+    stalled_reset_at: int
+    observed_count: int
+    heartbeat_sent_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +267,19 @@ def _normalized_window_expr():
     return func.coalesce(UsageHistory.window, _PRIMARY_WINDOW_LITERAL)
 
 
+def _post_reset_observation_snapshot(
+    row: PostResetHeartbeatObservation,
+) -> PostResetHeartbeatObservationSnapshot:
+    return PostResetHeartbeatObservationSnapshot(
+        id=row.id,
+        account_id=row.account_id,
+        window=row.window,
+        stalled_reset_at=row.stalled_reset_at,
+        observed_count=row.observed_count,
+        heartbeat_sent_at=row.heartbeat_sent_at,
+    )
+
+
 def _window_clause(window: str | None):
     if not window or window == "primary":
         return _normalized_window_expr() == "primary"
@@ -468,6 +491,71 @@ class UsageRepository:
             await self._session.commit()
             await self._session.refresh(entry)
         return entry
+
+    async def record_post_reset_observation(
+        self,
+        *,
+        account_id: str,
+        window: str,
+        stalled_reset_at: int,
+        observed_at: datetime | None = None,
+    ) -> PostResetHeartbeatObservationSnapshot:
+        now = observed_at or utcnow()
+        stmt = (
+            select(PostResetHeartbeatObservation)
+            .where(PostResetHeartbeatObservation.account_id == account_id)
+            .where(PostResetHeartbeatObservation.window == window)
+            .where(PostResetHeartbeatObservation.stalled_reset_at == stalled_reset_at)
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = PostResetHeartbeatObservation(
+                account_id=account_id,
+                window=window,
+                stalled_reset_at=stalled_reset_at,
+                observed_count=1,
+                first_observed_at=now,
+                last_observed_at=now,
+            )
+            self._session.add(row)
+        else:
+            row.observed_count += 1
+            row.last_observed_at = now
+        async with sqlite_writer_section():
+            await self._session.commit()
+            await self._session.refresh(row)
+        return _post_reset_observation_snapshot(row)
+
+    async def mark_post_reset_heartbeat_sent(
+        self,
+        observation_id: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> bool:
+        row = await self._session.get(PostResetHeartbeatObservation, observation_id)
+        if row is None or row.heartbeat_sent_at is not None:
+            return False
+        row.heartbeat_sent_at = sent_at or utcnow()
+        async with sqlite_writer_section():
+            await self._session.commit()
+        return True
+
+    async def clear_post_reset_observations(
+        self,
+        *,
+        account_id: str,
+        window: str,
+    ) -> int:
+        stmt = delete(PostResetHeartbeatObservation).where(
+            PostResetHeartbeatObservation.account_id == account_id,
+            PostResetHeartbeatObservation.window == window,
+        )
+        async with sqlite_writer_section():
+            result = await self._session.execute(stmt)
+            await self._session.commit()
+        return int(result.rowcount or 0)
 
     async def aggregate_since(
         self,

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping, Protocol, cast
 
+import aiohttp
+
 from app.core import usage as usage_core
 from app.core.auth.refresh import RefreshError
 from app.core.balancer import (
@@ -17,6 +19,7 @@ from app.core.balancer import (
     QUOTA_EXCEEDED_COOLDOWN_SECONDS,
     account_status_for_permanent_failure,
 )
+from app.core.clients.http import lease_http_session
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
@@ -34,6 +37,13 @@ from app.modules.usage.repository import AdditionalUsageRepository
 logger = logging.getLogger(__name__)
 
 
+POST_RESET_HEARTBEAT_OBSERVATION_THRESHOLD = 3
+POST_RESET_HEARTBEAT_MODEL = "gpt-5.5"
+POST_RESET_HEARTBEAT_MAX_OUTPUT_TOKENS = 8
+POST_RESET_HEARTBEAT_TIMEOUT_SECONDS = 30.0
+POST_RESET_HEARTBEAT_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
 class UsageRepositoryPort(Protocol):
     async def latest_entry_for_account(
         self,
@@ -41,6 +51,29 @@ class UsageRepositoryPort(Protocol):
         *,
         window: str | None = None,
     ) -> UsageHistory | None: ...
+
+    async def record_post_reset_observation(
+        self,
+        *,
+        account_id: str,
+        window: str,
+        stalled_reset_at: int,
+        observed_at: datetime | None = None,
+    ) -> PostResetHeartbeatObservationLike: ...
+
+    async def mark_post_reset_heartbeat_sent(
+        self,
+        observation_id: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> bool: ...
+
+    async def clear_post_reset_observations(
+        self,
+        *,
+        account_id: str,
+        window: str,
+    ) -> int: ...
 
     async def add_entry(
         self,
@@ -56,6 +89,15 @@ class UsageRepositoryPort(Protocol):
         credits_unlimited: bool | None = None,
         credits_balance: float | None = None,
     ) -> UsageHistory | None: ...
+
+
+class PostResetHeartbeatObservationLike(Protocol):
+    id: int
+    account_id: str
+    window: str
+    stalled_reset_at: int
+    observed_count: int
+    heartbeat_sent_at: datetime | None
 
 
 class AdditionalUsageRepositoryPort(Protocol):
@@ -107,6 +149,21 @@ class AdditionalUsageRepositoryPort(Protocol):
     ) -> list[str]: ...
 
     async def latest_recorded_at_for_account(self, account_id: str) -> datetime | None: ...
+
+
+class RequestLogsRepositoryPort(Protocol):
+    async def add_log(
+        self,
+        account_id: str | None,
+        request_id: str,
+        model: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        latency_ms: int | None,
+        status: str,
+        error_code: str | None,
+        **kwargs: object,
+    ) -> object: ...
 
 
 class AccountsRepositoryWithStatusComparePort(AccountsRepositoryPort, Protocol):
@@ -228,11 +285,12 @@ class UsageUpdater:
         usage_repo: UsageRepositoryPort,
         accounts_repo: AccountsRepositoryPort | None = None,
         additional_usage_repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository | None = None,
+        request_logs_repo: RequestLogsRepositoryPort | None = None,
     ) -> None:
         self._usage_repo = usage_repo
         self._accounts_repo = accounts_repo
         self._additional_usage_repo = additional_usage_repo
-        self._accounts_repo = accounts_repo
+        self._request_logs_repo = request_logs_repo
         self._encryptor = TokenEncryptor()
         self._auth_manager = AuthManager(accounts_repo) if accounts_repo else None
 
@@ -574,8 +632,190 @@ class UsageUpdater:
                 credits_balance=credits_balance,
             )
             usage_written = usage_written or _usage_entry_written(entry)
+
+        await self._process_post_reset_heartbeats(
+            account,
+            primary=primary,
+            secondary=secondary,
+            monthly=monthly,
+            now_epoch=now_epoch,
+        )
         await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
         return AccountRefreshResult(usage_written=usage_written)
+
+    async def _process_post_reset_heartbeats(
+        self,
+        account: Account,
+        *,
+        primary: UsageWindow | None,
+        secondary: UsageWindow | None,
+        monthly: UsageWindow | None,
+        now_epoch: int,
+    ) -> None:
+        if account.status == AccountStatus.PAUSED:
+            return
+        for window_name, window in (
+            ("primary", primary),
+            ("secondary", secondary),
+            ("monthly", monthly),
+        ):
+            await self._process_post_reset_heartbeat_window(
+                account,
+                window_name=window_name,
+                window=window,
+                now_epoch=now_epoch,
+            )
+
+    async def _process_post_reset_heartbeat_window(
+        self,
+        account: Account,
+        *,
+        window_name: str,
+        window: UsageWindow | None,
+        now_epoch: int,
+    ) -> None:
+        reset_at = _window_reset_at(window, now_epoch)
+        if reset_at is None or reset_at > now_epoch:
+            await self._usage_repo.clear_post_reset_observations(
+                account_id=account.id,
+                window=window_name,
+            )
+            return
+
+        observation = await self._usage_repo.record_post_reset_observation(
+            account_id=account.id,
+            window=window_name,
+            stalled_reset_at=reset_at,
+        )
+        if observation.heartbeat_sent_at is not None:
+            return
+        if observation.observed_count < POST_RESET_HEARTBEAT_OBSERVATION_THRESHOLD:
+            return
+
+        marked = await self._usage_repo.mark_post_reset_heartbeat_sent(observation.id)
+        if not marked:
+            return
+        await self._send_post_reset_heartbeat(account, window_name=window_name, stalled_reset_at=reset_at)
+
+    async def _send_post_reset_heartbeat(
+        self,
+        account: Account,
+        *,
+        window_name: str,
+        stalled_reset_at: int,
+    ) -> int:
+        access_token = self._encryptor.decrypt(account.access_token_encrypted)
+        settings = get_settings()
+        base = settings.upstream_base_url.rstrip("/")
+        if "/backend-api" not in base:
+            base = f"{base}/backend-api"
+        url = f"{base}/codex/responses"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if account.chatgpt_account_id and not account.chatgpt_account_id.startswith(("email_", "local_")):
+            headers["chatgpt-account-id"] = account.chatgpt_account_id
+        body = {
+            "model": POST_RESET_HEARTBEAT_MODEL,
+            "instructions": "Reply with hi.",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                }
+            ],
+            "max_output_tokens": POST_RESET_HEARTBEAT_MAX_OUTPUT_TOKENS,
+            "stream": False,
+            "store": False,
+        }
+        timeout = aiohttp.ClientTimeout(
+            total=POST_RESET_HEARTBEAT_TIMEOUT_SECONDS,
+            sock_connect=POST_RESET_HEARTBEAT_CONNECT_TIMEOUT_SECONDS,
+        )
+        started_at = utcnow()
+        started_monotonic = time.monotonic()
+        status_code = 0
+        error_message: str | None = None
+        try:
+            async with lease_http_session() as session:
+                async with session.post(url, headers=headers, json=body, timeout=timeout) as resp:
+                    await resp.read()
+                    status_code = resp.status
+                    logger.info(
+                        "Post-reset heartbeat sent account_id=%s window=%s stalled_reset_at=%s status=%s",
+                        account.id,
+                        window_name,
+                        stalled_reset_at,
+                        resp.status,
+                    )
+                    return resp.status
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            error_message = str(exc)
+            logger.warning(
+                "Post-reset heartbeat failed account_id=%s window=%s stalled_reset_at=%s error=%s",
+                account.id,
+                window_name,
+                stalled_reset_at,
+                exc,
+            )
+            return 0
+        finally:
+            latency_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
+            await self._log_post_reset_heartbeat_request(
+                account,
+                window_name=window_name,
+                stalled_reset_at=stalled_reset_at,
+                requested_at=started_at,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                error_message=error_message,
+            )
+
+    async def _log_post_reset_heartbeat_request(
+        self,
+        account: Account,
+        *,
+        window_name: str,
+        stalled_reset_at: int,
+        requested_at: datetime,
+        latency_ms: int,
+        status_code: int,
+        error_message: str | None,
+    ) -> None:
+        if self._request_logs_repo is None:
+            return
+        success = 200 <= status_code < 400
+        try:
+            await self._request_logs_repo.add_log(
+                account_id=account.id,
+                request_id=f"post-reset-heartbeat-{account.id}-{window_name}-{stalled_reset_at}",
+                model=POST_RESET_HEARTBEAT_MODEL,
+                input_tokens=1,
+                output_tokens=None,
+                latency_ms=latency_ms,
+                status="success" if success else "error",
+                error_code=None if success else "post_reset_heartbeat_failed",
+                error_message=error_message,
+                requested_at=requested_at,
+                transport="post_reset_heartbeat",
+                plan_type=account.plan_type,
+                source="post_reset_heartbeat",
+                useragent_group="system",
+                failure_phase=None if success else "post_reset_heartbeat",
+                failure_detail=None if success else f"window={window_name} stalled_reset_at={stalled_reset_at}",
+                upstream_status_code=status_code if status_code > 0 else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record post-reset heartbeat request log "
+                "account_id=%s window=%s stalled_reset_at=%s error=%s",
+                account.id,
+                window_name,
+                stalled_reset_at,
+                exc,
+            )
 
     async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
         if not self._auth_manager:
@@ -734,6 +974,12 @@ class UsageUpdater:
         account.deactivation_reason = stored.deactivation_reason
         account.reset_at = stored.reset_at
         account.blocked_at = stored.blocked_at
+
+
+def _window_reset_at(window: UsageWindow | None, now_epoch: int) -> int | None:
+    if window is None:
+        return None
+    return _reset_at(window.reset_at, window.reset_after_seconds, now_epoch)
 
 
 def _credits_snapshot(payload: UsagePayload) -> tuple[bool | None, bool | None, float | None]:
@@ -938,7 +1184,15 @@ def _latest_usage_is_fresh(
 ) -> bool:
     if latest is None:
         return False
-    if (now - latest.recorded_at).total_seconds() >= interval_seconds:
+    recorded_at = latest.recorded_at
+    comparison_now = now
+    if recorded_at.tzinfo is None and comparison_now.tzinfo is None:
+        comparison_now = datetime.now()
+    elif recorded_at.tzinfo is not None and comparison_now.tzinfo is None:
+        comparison_now = comparison_now.replace(tzinfo=timezone.utc)
+    elif recorded_at.tzinfo is None and comparison_now.tzinfo is not None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    if (comparison_now - recorded_at).total_seconds() >= interval_seconds:
         return False
     if latest.reset_at is not None:
         now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
