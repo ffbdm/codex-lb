@@ -813,7 +813,7 @@ async def test_post_reset_heartbeat_records_request_log() -> None:
     assert call["kwargs"]["model"] == usage_updater_module.POST_RESET_HEARTBEAT_MODEL
     assert call["kwargs"]["status"] == "success"
     assert call["kwargs"]["source"] == "post_reset_heartbeat"
-    assert call["kwargs"]["transport"] == "post_reset_heartbeat"
+    assert call["kwargs"]["transport"] == "http"
     assert call["kwargs"]["upstream_status_code"] == 200
 
 

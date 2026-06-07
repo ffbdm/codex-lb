@@ -799,7 +799,7 @@ class UsageUpdater:
                 error_code=None if success else "post_reset_heartbeat_failed",
                 error_message=error_message,
                 requested_at=requested_at,
-                transport="post_reset_heartbeat",
+                transport="http",
                 plan_type=account.plan_type,
                 source="post_reset_heartbeat",
                 useragent_group="system",
