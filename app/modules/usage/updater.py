@@ -189,6 +189,16 @@ class AccountRefreshResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _PostResetHeartbeatRequest:
+    account_id: str
+    access_token_encrypted: str
+    chatgpt_account_id: str | None
+    plan_type: str | None
+    window_name: str
+    stalled_reset_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class _MergedAdditionalWindow:
     limit_name: str
     metered_feature: str
@@ -202,6 +212,7 @@ class _MergedAdditionalWindow:
 # process. Updated only after a successful refresh that wrote data.
 _last_successful_refresh: dict[str, datetime] = {}
 _usage_refresh_auth_cooldowns: dict[str, float] = {}
+_post_reset_heartbeat_tasks: set[asyncio.Task[int]] = set()
 
 
 class _UsageRefreshSingleflight:
@@ -695,7 +706,21 @@ class UsageUpdater:
         marked = await self._usage_repo.mark_post_reset_heartbeat_sent(observation.id)
         if not marked:
             return
-        await self._send_post_reset_heartbeat(account, window_name=window_name, stalled_reset_at=reset_at)
+        self._schedule_post_reset_heartbeat(
+            _post_reset_heartbeat_request_from_account(
+                account,
+                window_name=window_name,
+                stalled_reset_at=reset_at,
+            )
+        )
+
+    def _schedule_post_reset_heartbeat(self, request: _PostResetHeartbeatRequest) -> None:
+        task = asyncio.create_task(
+            _send_post_reset_heartbeat_request(request),
+            name=f"post-reset-heartbeat-{request.account_id}-{request.window_name}-{request.stalled_reset_at}",
+        )
+        _post_reset_heartbeat_tasks.add(task)
+        task.add_done_callback(_post_reset_heartbeat_task_done)
 
     async def _send_post_reset_heartbeat(
         self,
@@ -704,74 +729,14 @@ class UsageUpdater:
         window_name: str,
         stalled_reset_at: int,
     ) -> int:
-        access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        settings = get_settings()
-        base = settings.upstream_base_url.rstrip("/")
-        if "/backend-api" not in base:
-            base = f"{base}/backend-api"
-        url = f"{base}/codex/responses"
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        if account.chatgpt_account_id and not account.chatgpt_account_id.startswith(("email_", "local_")):
-            headers["chatgpt-account-id"] = account.chatgpt_account_id
-        body = {
-            "model": POST_RESET_HEARTBEAT_MODEL,
-            "instructions": "Reply with hi.",
-            "input": [
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                }
-            ],
-            "max_output_tokens": POST_RESET_HEARTBEAT_MAX_OUTPUT_TOKENS,
-            "stream": False,
-            "store": False,
-        }
-        timeout = aiohttp.ClientTimeout(
-            total=POST_RESET_HEARTBEAT_TIMEOUT_SECONDS,
-            sock_connect=POST_RESET_HEARTBEAT_CONNECT_TIMEOUT_SECONDS,
-        )
-        started_at = utcnow()
-        started_monotonic = time.monotonic()
-        status_code = 0
-        error_message: str | None = None
-        try:
-            async with lease_http_session() as session:
-                async with session.post(url, headers=headers, json=body, timeout=timeout) as resp:
-                    await resp.read()
-                    status_code = resp.status
-                    logger.info(
-                        "Post-reset heartbeat sent account_id=%s window=%s stalled_reset_at=%s status=%s",
-                        account.id,
-                        window_name,
-                        stalled_reset_at,
-                        resp.status,
-                    )
-                    return resp.status
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            error_message = str(exc)
-            logger.warning(
-                "Post-reset heartbeat failed account_id=%s window=%s stalled_reset_at=%s error=%s",
-                account.id,
-                window_name,
-                stalled_reset_at,
-                exc,
-            )
-            return 0
-        finally:
-            latency_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
-            await self._log_post_reset_heartbeat_request(
+        return await _send_post_reset_heartbeat_request(
+            _post_reset_heartbeat_request_from_account(
                 account,
                 window_name=window_name,
                 stalled_reset_at=stalled_reset_at,
-                requested_at=started_at,
-                latency_ms=latency_ms,
-                status_code=status_code,
-                error_message=error_message,
-            )
+            ),
+            request_logs_repo=self._request_logs_repo,
+        )
 
     async def _log_post_reset_heartbeat_request(
         self,
@@ -786,36 +751,18 @@ class UsageUpdater:
     ) -> None:
         if self._request_logs_repo is None:
             return
-        success = 200 <= status_code < 400
-        try:
-            await self._request_logs_repo.add_log(
-                account_id=account.id,
-                request_id=f"post-reset-heartbeat-{account.id}-{window_name}-{stalled_reset_at}",
-                model=POST_RESET_HEARTBEAT_MODEL,
-                input_tokens=1,
-                output_tokens=None,
-                latency_ms=latency_ms,
-                status="success" if success else "error",
-                error_code=None if success else "post_reset_heartbeat_failed",
-                error_message=error_message,
-                requested_at=requested_at,
-                transport="http",
-                plan_type=account.plan_type,
-                source="post_reset_heartbeat",
-                useragent_group="system",
-                failure_phase=None if success else "post_reset_heartbeat",
-                failure_detail=None if success else f"window={window_name} stalled_reset_at={stalled_reset_at}",
-                upstream_status_code=status_code if status_code > 0 else None,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to record post-reset heartbeat request log "
-                "account_id=%s window=%s stalled_reset_at=%s error=%s",
-                account.id,
-                window_name,
-                stalled_reset_at,
-                exc,
-            )
+        await _log_post_reset_heartbeat_request(
+            _post_reset_heartbeat_request_from_account(
+                account,
+                window_name=window_name,
+                stalled_reset_at=stalled_reset_at,
+            ),
+            requested_at=requested_at,
+            latency_ms=latency_ms,
+            status_code=status_code,
+            error_message=error_message,
+            request_logs_repo=self._request_logs_repo,
+        )
 
     async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
         if not self._auth_manager:
@@ -980,6 +927,164 @@ def _window_reset_at(window: UsageWindow | None, now_epoch: int) -> int | None:
     if window is None:
         return None
     return _reset_at(window.reset_at, window.reset_after_seconds, now_epoch)
+
+
+def _post_reset_heartbeat_request_from_account(
+    account: Account,
+    *,
+    window_name: str,
+    stalled_reset_at: int,
+) -> _PostResetHeartbeatRequest:
+    return _PostResetHeartbeatRequest(
+        account_id=account.id,
+        access_token_encrypted=account.access_token_encrypted,
+        chatgpt_account_id=account.chatgpt_account_id,
+        plan_type=account.plan_type,
+        window_name=window_name,
+        stalled_reset_at=stalled_reset_at,
+    )
+
+
+def _post_reset_heartbeat_task_done(task: asyncio.Task[int]) -> None:
+    _post_reset_heartbeat_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Post-reset heartbeat background task failed")
+
+
+async def _send_post_reset_heartbeat_request(
+    request: _PostResetHeartbeatRequest,
+    *,
+    request_logs_repo: RequestLogsRepositoryPort | None = None,
+) -> int:
+    access_token = TokenEncryptor().decrypt(request.access_token_encrypted)
+    settings = get_settings()
+    base = settings.upstream_base_url.rstrip("/")
+    if "/backend-api" not in base:
+        base = f"{base}/backend-api"
+    url = f"{base}/codex/responses"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if request.chatgpt_account_id and not request.chatgpt_account_id.startswith(("email_", "local_")):
+        headers["chatgpt-account-id"] = request.chatgpt_account_id
+    body = {
+        "model": POST_RESET_HEARTBEAT_MODEL,
+        "instructions": "Reply with hi.",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            }
+        ],
+        "max_output_tokens": POST_RESET_HEARTBEAT_MAX_OUTPUT_TOKENS,
+        "stream": False,
+        "store": False,
+    }
+    timeout = aiohttp.ClientTimeout(
+        total=POST_RESET_HEARTBEAT_TIMEOUT_SECONDS,
+        sock_connect=POST_RESET_HEARTBEAT_CONNECT_TIMEOUT_SECONDS,
+    )
+    started_at = utcnow()
+    started_monotonic = time.monotonic()
+    status_code = 0
+    error_message: str | None = None
+    try:
+        async with lease_http_session() as session:
+            async with session.post(url, headers=headers, json=body, timeout=timeout) as resp:
+                await resp.read()
+                status_code = resp.status
+                logger.info(
+                    "Post-reset heartbeat sent account_id=%s window=%s stalled_reset_at=%s status=%s",
+                    request.account_id,
+                    request.window_name,
+                    request.stalled_reset_at,
+                    resp.status,
+                )
+                return resp.status
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        error_message = str(exc)
+        logger.warning(
+            "Post-reset heartbeat failed account_id=%s window=%s stalled_reset_at=%s error=%s",
+            request.account_id,
+            request.window_name,
+            request.stalled_reset_at,
+            exc,
+        )
+        return 0
+    finally:
+        latency_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
+        await _log_post_reset_heartbeat_request(
+            request,
+            requested_at=started_at,
+            latency_ms=latency_ms,
+            status_code=status_code,
+            error_message=error_message,
+            request_logs_repo=request_logs_repo,
+        )
+
+
+async def _log_post_reset_heartbeat_request(
+    request: _PostResetHeartbeatRequest,
+    *,
+    requested_at: datetime,
+    latency_ms: int,
+    status_code: int,
+    error_message: str | None,
+    request_logs_repo: RequestLogsRepositoryPort | None = None,
+) -> None:
+    if request_logs_repo is None:
+        from app.modules.request_logs.repository import RequestLogsRepository
+
+        async with get_background_session() as session:
+            await _log_post_reset_heartbeat_request(
+                request,
+                requested_at=requested_at,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                error_message=error_message,
+                request_logs_repo=RequestLogsRepository(session),
+            )
+        return
+
+    success = 200 <= status_code < 400
+    failure_detail = None
+    if not success:
+        failure_detail = f"window={request.window_name} stalled_reset_at={request.stalled_reset_at}"
+    try:
+        await request_logs_repo.add_log(
+            account_id=request.account_id,
+            request_id=f"post-reset-heartbeat-{request.account_id}-{request.window_name}-{request.stalled_reset_at}",
+            model=POST_RESET_HEARTBEAT_MODEL,
+            input_tokens=1,
+            output_tokens=None,
+            latency_ms=latency_ms,
+            status="success" if success else "error",
+            error_code=None if success else "post_reset_heartbeat_failed",
+            error_message=error_message,
+            requested_at=requested_at,
+            transport="http",
+            plan_type=request.plan_type,
+            source="post_reset_heartbeat",
+            useragent_group="system",
+            failure_phase=None if success else "post_reset_heartbeat",
+            failure_detail=failure_detail,
+            upstream_status_code=status_code if status_code > 0 else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record post-reset heartbeat request log "
+            "account_id=%s window=%s stalled_reset_at=%s error=%s",
+            request.account_id,
+            request.window_name,
+            request.stalled_reset_at,
+            exc,
+        )
 
 
 def _credits_snapshot(payload: UsagePayload) -> tuple[bool | None, bool | None, float | None]:
@@ -1328,3 +1433,6 @@ def _clear_usage_refresh_state() -> None:
     _usage_refresh_auth_cooldowns.clear()
     _last_successful_refresh.clear()
     _USAGE_REFRESH_SINGLEFLIGHT.clear()
+    for task in list(_post_reset_heartbeat_tasks):
+        task.cancel()
+    _post_reset_heartbeat_tasks.clear()

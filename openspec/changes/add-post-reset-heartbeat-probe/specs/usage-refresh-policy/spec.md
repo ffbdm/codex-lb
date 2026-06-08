@@ -3,6 +3,7 @@
 ### Requirement: Post-reset heartbeat probes nudge stale upstream windows
 
 The usage refresh scheduler MUST detect refreshed account quota windows whose `reset_at` remains expired across repeated refresh observations. After the same account, window, and expired reset timestamp has been observed at least three times, the scheduler MUST send one real lightweight upstream `responses.create` heartbeat pinned to that account, separate from the manual Force probe endpoint, MUST mark that heartbeat as sent so it is not repeated for the same reset timestamp, and MUST record the attempt in Request Logs with a system source that identifies the automatic post-reset heartbeat.
+Automatic heartbeat delivery MUST NOT block the main usage refresh path after the stale observation has been recorded and marked for one-shot delivery.
 
 #### Scenario: Stale primary reset triggers one heartbeat
 - **GIVEN** an account refresh returns a primary window with `reset_at` in the past
@@ -11,6 +12,7 @@ The usage refresh scheduler MUST detect refreshed account quota windows whose `r
 - **THEN** the scheduler sends one non-streaming heartbeat request with input `hi`, `store=false`, and a small output cap pinned to that account
 - **AND** the heartbeat is marked sent for that account/window/reset timestamp
 - **AND** a Request Logs entry is recorded with `source` set to `post_reset_heartbeat` and `transport` set to `http`
+- **AND** the scheduler can continue usage refresh completion, cache invalidation, and status reconciliation without waiting for the upstream heartbeat response
 
 #### Scenario: Already-sent heartbeat is not repeated
 - **GIVEN** a heartbeat has already been sent for an account/window/reset timestamp

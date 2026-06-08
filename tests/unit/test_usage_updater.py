@@ -725,8 +725,8 @@ async def test_post_reset_heartbeat_sends_after_three_stale_observations(monkeyp
     account = _make_account("acc_post_reset_heartbeat", "workspace_post_reset_heartbeat")
     now_epoch = 1_700_000_000
     stale_reset_at = now_epoch - 1
-    heartbeat = AsyncMock(return_value=200)
-    monkeypatch.setattr(updater, "_send_post_reset_heartbeat", heartbeat)
+    scheduled: list[usage_updater_module._PostResetHeartbeatRequest] = []
+    monkeypatch.setattr(updater, "_schedule_post_reset_heartbeat", scheduled.append)
 
     window = usage_updater_module.UsageWindow(used_percent=99.0, reset_at=stale_reset_at)
 
@@ -742,7 +742,7 @@ async def test_post_reset_heartbeat_sends_after_three_stale_observations(monkeyp
         window=window,
         now_epoch=now_epoch,
     )
-    heartbeat.assert_not_awaited()
+    assert scheduled == []
 
     await updater._process_post_reset_heartbeat_window(
         account,
@@ -751,7 +751,10 @@ async def test_post_reset_heartbeat_sends_after_three_stale_observations(monkeyp
         now_epoch=now_epoch,
     )
 
-    heartbeat.assert_awaited_once_with(account, window_name="primary", stalled_reset_at=stale_reset_at)
+    assert len(scheduled) == 1
+    assert scheduled[0].account_id == account.id
+    assert scheduled[0].window_name == "primary"
+    assert scheduled[0].stalled_reset_at == stale_reset_at
 
     await updater._process_post_reset_heartbeat_window(
         account,
@@ -760,7 +763,7 @@ async def test_post_reset_heartbeat_sends_after_three_stale_observations(monkeyp
         now_epoch=now_epoch,
     )
 
-    heartbeat.assert_awaited_once()
+    assert len(scheduled) == 1
     observation = usage_repo.observations[(account.id, "primary", stale_reset_at)]
     assert observation.observed_count == 4
     assert observation.heartbeat_sent_at is not None
@@ -815,6 +818,57 @@ async def test_post_reset_heartbeat_records_request_log() -> None:
     assert call["kwargs"]["source"] == "post_reset_heartbeat"
     assert call["kwargs"]["transport"] == "http"
     assert call["kwargs"]["upstream_status_code"] == 200
+
+
+@pytest.mark.asyncio
+async def test_post_reset_heartbeat_task_does_not_block_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage_repo = StubUsageRepository()
+    updater = UsageUpdater(usage_repo)
+    account = _make_account("acc_post_reset_background", "workspace_post_reset_background")
+    now_epoch = 1_700_000_000
+    stale_reset_at = now_epoch - 1
+    release_heartbeat = asyncio.Event()
+    heartbeat_started = asyncio.Event()
+
+    async def send_heartbeat(
+        request: usage_updater_module._PostResetHeartbeatRequest,
+        **_: Any,
+    ) -> int:
+        assert request.account_id == account.id
+        heartbeat_started.set()
+        await release_heartbeat.wait()
+        return 200
+
+    monkeypatch.setattr(usage_updater_module, "_send_post_reset_heartbeat_request", send_heartbeat)
+
+    window = usage_updater_module.UsageWindow(used_percent=99.0, reset_at=stale_reset_at)
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+    await updater._process_post_reset_heartbeat_window(
+        account,
+        window_name="primary",
+        window=window,
+        now_epoch=now_epoch,
+    )
+
+    await asyncio.wait_for(
+        updater._process_post_reset_heartbeat_window(
+            account,
+            window_name="primary",
+            window=window,
+            now_epoch=now_epoch,
+        ),
+        timeout=0.1,
+    )
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=0.1)
+    assert usage_updater_module._post_reset_heartbeat_tasks
+
+    release_heartbeat.set()
+    await asyncio.gather(*list(usage_updater_module._post_reset_heartbeat_tasks))
 
 
 @pytest.mark.asyncio
